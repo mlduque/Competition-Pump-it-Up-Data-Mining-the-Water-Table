@@ -1,0 +1,909 @@
+---
+title: "Competition: Pump it Up Data Mining the Water Table"
+author:   "by [María Luisa Duque](https://www.linkedin.com/in/marialuisaduque/)"
+mail:     "marialdu@ucm.es"
+linkedin: "marialuisaduque"
+github:   "mlduque"
+date:     "`r Sys.Date()`"
+license:  by-nc-sa
+urlcolor: blue
+output:
+  html_document: 
+    theme:        cosmo # "default", "cerulean", "paper", "flatly", "readable", "spacelab", "united", "cosmo", "lumen", "sandstone", "simplex", "yeti"
+    highlight:    tango # "default", "tango", "pygments", "kate", "monochrome", "espresso", "zenburn", "haddock", "tango"
+    toc:          TRUE
+    toc_float:    TRUE
+    code_folding: show
+    includes:
+      after_body: footer.html
+  pdf_document:   default
+  epuRate::epurate:
+    number_sections: FALSE
+    code_folding:    "show"
+    toc:          TRUE 
+    word_document:  default
+  rmdformats::readthedown:
+    toc:          TRUE 
+    toc_float:    TRUE     
+---
+
+## INTRODUCCIÓN
+
+El objetivo del presente trabajo es lograr la obtención de la mejor predicción para la competición ["Pump it Up Data Mining the Water Table"](https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table/) de referencia; para ello, hemos explorado los datos, analizado, preparado, pre-procesado, seleccionado y hemos implementado los modelos **ranger()** y **xgboost()** para buscar aquél con el que se obtuviera un mejor score en la competición descrita.
+
+El conjunto de datos original contiene 41 variables.
+
+Los datasets a usar, proporcionados por la competición, son tres archivos .csv:
+
+* 01_labels
+* 02_trainset
+* 03_testset
+
+El objetivo es predecir qué pozos en la región de Tanzania serán funcionales, no funcionales o necesitarán reparación.
+
+Los mejores resultados serán los obtenidos con el modelo **ranger()**, un score igual a **0,8265**.
+
+El mejor score obtenido con el modelo **xgboost()** será igual a **0,8147**.
+
+### Librerías y fijación del directorio de trabajo
+
+```{r message=FALSE, warning=FALSE}
+# Cargo las librerias
+library(dataPreparation)
+library(lubridate)
+library(ranger)
+library(data.table) # Para cargar y manipular
+library(inspectdf)
+library(dplyr)      # Para manipular
+library(ggplot2)
+library(ranger)
+library(caret)
+library(corrplot)
+library (rpart)
+library (rpart.plot)
+library(DataExplorer)
+
+# Fijo la semilla, 42 por buenas prácticas
+set.seed(42)
+
+# Fijo el directorio de trabajo
+setwd('C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition')
+```
+
+### Carga de datos
+
+```{r}
+# Labels
+datLabel <- as.data.frame(fread("01_labels.csv", nThread = 4 ))
+dim(datLabel)
+
+# Train
+datTrain <- as.data.frame(fread("02_trainset.csv", nThread = 4 ))
+dim(datTrain)
+
+# Test
+datTest <- as.data.frame(fread('03_testset.csv', nThread = 4 ))
+dim(datTest)
+```
+
+### Unión de Labels y Train
+
+```{r}
+all.equal(datLabel[,1], datTrain[,1])
+```
+
+Tienen el mismo órden, aunque hago un merge.
+
+```{r}
+datEnd <- merge(datTrain, datLabel, by.x = "id", by.y="id", all = TRUE)
+
+# Visualizamos el conjunto de datos datEnd
+head(datEnd)
+
+colnames(datEnd)
+```
+
+## EDA: EXPLORATORY DATA ANALYSIS
+
+Antes de hacer un trabajo de pre-procesado de los datos, consideramos conveniente realizar un Exploratory Data Analysis de los mismos para tener un poco más de información acerca de los datos y variables con las que estamos tratando; en definitiva, para conocer mejor los datos con los que estamos tratando.
+
+```{r}
+# Visualización de la estructura de nuestros datos
+plot_str(datEnd)
+```
+
+![plot_str(datEnd)](C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/Rplot.jpeg)
+
+Como podemos observar, en nuestro dataset datEnd disponemos de 41 variables y 59400 observaciones, así como visualizar el tipo de datos que tenemos por cada variable.
+
+```{r}
+# Filas, columnas, observaciones, missings
+introduce(datEnd)
+plot_intro(datEnd)
+```
+
+Tenemos columnas continuas y discretas y además un total, indica, de 0.26% de observacionse missings.
+
+```{r}
+# Valores missings por variable
+plot_missing(datEnd)
+profile_missing(datEnd)
+```
+
+Los valores missings se concentran en dos variables: permit y public_meeting. Posteriormente habrá que tratarlas en el preprocesado.
+
+```{r}
+# Bar charts: visualización de las distribuciones de frecuencias para las variables discretas
+plot_bar(datEnd)
+
+# Histogramas: visualización de las distribuciones para las variables continuas
+plot_histogram(datEnd)
+```
+
+Hay algunas cosas que podemos percibir, hay observaciones de latitude y longitude igual a 0, hecho que no resulta real puesto que los datos son del país Tanzania y este país está sobre el nivel del mar. La variable recorded_by sólo presenta un valor, no aporta información alguna, podría ser eliminada o no tomada en cuenta para nuestro modelo.
+
+```{r}
+# QQPlot
+qq_data <- datEnd[, c("amount_tsh", "population")]
+plot_qq(qq_data, sampled_rows = 1000L)
+```
+
+Quantile-Quantile plot es un modo para visualizar la desviación desde una específica probabilidad de distribución. Suele ser beneficioso para aplicar transformaciones tales como logaritmo sobre alguna de nuestras variables. Aquí, podrías considerar algunas transformación sobre amount_tsh y quizá sobre population, lo sopesaremos más adelante.
+
+```{r}
+# Análisis de correlación: mapa de calor para las variables continuas
+plot_correlation(na.omit(datEnd), type = "c")
+
+# Boxplots: Visualización de las distribuciones de las variables continuas
+plot_boxplot(datEnd, by = "status_group")
+```
+
+## FEATURE ENGINEERING Y PREPROCESADO
+
+Feature engineering es el proceso de creación de nuevas variables desde variables existentes. Las nuevas variables creadas, generalmente aportan nueva información valiosa. 
+También llevaremos a cabo un preprocesado. El objetivo es conseguir el tratamiento de los datos más óptimo.
+
+### Transformación de variables a Factor
+
+Analizando el dataset, compruebo que determinadas variables pueden ser pasadas a factor para garantizar un mejor funcionamiento de/los modelos posteriormente.
+
+Estas variables son: waterpoint_type_group, basin, region, scheme_management, extraction_type, extraction_type_group, extraction_type_class, management, management_group, payment, payment_type, water_quality, quality_group, quantity, quantity_group, source, source_type, source_class, waterpoint_type, status_group, permit y public_meeting.
+
+```{r}
+datEnd2 = datEnd
+datEnd2[,c(11, 13, 19, 21, 23, 25:41)] = lapply(datEnd2[,c(11, 13, 19, 21, 23, 25:41)], factor) # Train
+datTest[,c(11, 13, 19, 21, 23, 25:40)] = lapply(datTest[,c(11, 13, 19, 21, 23, 25:40)], factor) # Test
+```
+
+### Creación de variables dummies
+
+Hay tres variables categóricas que al ser transformadas en dummies funcionan mejor en nuestro modelo, tales variables son: permit, public_meeting y management_group. Las dos primeras están compuestas por TRUE/FALSE y la tercera está compuesta por cuatro valores que corresponde a la gestión del pozo en cuestión. También se detecta que las dos primeras variables, permit y public_meeting tienen valores missings o NA's, los imputaremos.
+
+```{r eval=FALSE}
+datEnd2$permit
+datEnd2$public_meeting
+datEnd2$management_group
+```
+
+Vamos a imputar los valores missings NA's, para ello definiremos previamente una función que nos permita hacerlo de forma eficiente y rápida. Imputaremos todos los valores missings de las variables tipo factor.
+
+```{r}
+# Definimos una función para la imputación variables cualitativas
+ImputacionCuali<-function(vv,tipo){#tipo debe tomar los valores moda o aleatorio
+  if (tipo=="moda"){
+    vv[is.na(vv)]<-names(sort(table(vv),decreasing = T))[1]
+  } else if (tipo=="aleatorio"){
+    vv[is.na(vv)]<-sample(vv[!is.na(vv)],sum(is.na(vv)),replace = T)
+  }
+  factor(vv)
+}
+
+# Imputo los valores missing NA's con método aleatorio antes de crear las variables dummies
+datEnd2[,as.vector(which(sapply(datEnd2, class)=="factor"))]<-sapply(Filter(is.factor, datEnd2),function(x) ImputacionCuali(x,"aleatorio"))
+
+datTest[,as.vector(which(sapply(datTest, class)=="factor"))]<-sapply(Filter(is.factor, datTest),function(x) ImputacionCuali(x,"aleatorio"))
+
+any(is.na(datEnd2$permit)) # Ya no tenemos NA's en permit
+any(is.na(datEnd2$public_meeting)) # Ya no tenemos NA's tampoco en public_meeting
+
+# Lo podemos graficar haciendo uso de DataExplorer
+no_missings <- set_missing(datEnd2, list(0L, "unknown"))
+plot_missing(no_missings)
+```
+
+Para realizar la creación de variables dummies vamos a hacer uso de la librería *fastDummies()*.
+
+```{r}
+library(fastDummies)
+
+# Creamos las dummies para permit, public_meeting y management_group tanto en Train como en Test
+datEnd2 = dummy_cols(datEnd2,  select_columns = c("permit", "public_meeting", "management_group")) # Train
+datTest = dummy_cols(datTest,  select_columns = c("permit", "public_meeting", "management_group")) # Test
+```
+
+### Creacion de variables adicionales
+
+**FUNDER (El fundador del pozo)**
+
+Extraemos la primera letra de la variable funder ya que mejora el modelo. La extraemos y la consideramos como factor tanto en train como en test.
+
+```{r}
+datEnd2$funder_2 = as.factor(substr(datEnd$funder, 1, 1)) # Train
+datTest$funder_2 = as.factor(substr(datTest$funder, 1, 1)) # Test
+```
+
+**VOLUMEN (Cantidad de agua disponible en cada pozo)**
+
+Creamos una variable del logaritmo de la variable amount_tsh. Escalamos la variable en el punto óptimo (que es 3.61). Transformamos la variable a logaritmica y luego hacemos dos tramos para convertirla en binaria.
+
+```{r}
+# Train
+datEnd2$volumen_log = log(datEnd2$amount_tsh + 1)
+datEnd2$volumen_2 = datEnd2$volumen_log * datEnd2$volumen_log
+datEnd2$volumen_bin = 0
+datEnd2$volumen_bin[datEnd2$volumen_log>3.61]=1
+
+# Test
+datTest$volumen_log = log(datTest$amount_tsh + 1)
+datTest$volumen_2 = datTest$volumen_log * datTest$volumen_log
+datTest$volumen_bin = 0
+datTest$volumen_bin[datTest$volumen_log>3.61]=1
+```
+
+**DATE_RECORDED (Fecha de registro del pozo)**
+
+Vamos a crear tres variables de antigüedad de los pozos registrados. Los días, los meses y los años. Para ello, tomamos de referencia la última fecha en la que se registro un pozo: 2014-01-01.
+
+```{r}
+# Train
+datEnd2$dif_days <- as.numeric(as.Date("2014-01-01") - as.Date(datEnd2$date_recorded))
+datEnd2$reg_month <- month(ymd(datEnd2$date_recorded))
+datEnd2$reg_year <- year(ymd(datEnd2$date_recorded))
+
+# Test
+datTest$dif_days <- as.numeric(as.Date("2014-01-01") - as.Date(datTest$date_recorded))
+datTest$reg_month <- month(ymd(datTest$date_recorded))
+datTest$reg_year <- year(ymd(datTest$date_recorded))
+```
+
+**LOCALIZACIÓN DE CADA POZO**
+
+Usando las variables longitude y latitude podemos crear una variable con la localización/posición de cada pozo.
+Para ello, haremos uso de la función *distGeo()* del paquete *geosphere*.
+
+```{r warning= FALSE}
+library(geosphere)
+
+# Train
+datEnd2$dist_geo <- distGeo(as.matrix(datEnd2[,c('longitude','latitude')]), c(0,0))
+
+# Test
+datTest$dist_geo <- distGeo(as.matrix(datTest[,c('longitude','latitude')]), c(0,0))
+```
+
+### Transformación de variables
+
+**LONGITUDE**
+
+Detectamos que en la variable longitud hay valores igual a 0, hecho que no puede ser realista ya Tanzania no está bajo nivel del mar o nivel del mar, Tanzania tiene una longitud con valores aproximadamente entre 24 y 40. Vamos a transoformar esos valores igual a 0 por el promedio (usando la media) de la longitud en cada una de las regiones del país. 
+
+```{r}
+# Train
+longsummary <- aggregate(longitude~region,data=datEnd2[(datEnd2$longitude!=0),], FUN=mean)
+datEnd2$longitud_ok = datEnd2$longitud
+nrow(datEnd2[datEnd2$longitud_ok==0,]) 
+
+listado_regiones = levels(datEnd2$region)
+for (r in listado_regiones){
+  datEnd2$longitud_ok[datEnd2$region== r & datEnd2$longitude==0] <- longsummary$longitude[longsummary== r]}
+
+# Test
+datTest$longitud_ok = datTest$longitud
+nrow(datTest[datTest$longitud_ok==0,]) 
+
+listado_regiones_test = levels(datTest$region)
+for (r in listado_regiones_test){
+  datTest$longitud_ok[datTest$region== r & datTest$longitude==0] <- longsummary$longitude[longsummary== r]}
+```
+
+**POPULATION**
+
+Escalamos la variable población para evitar posibles problemas de falta de distribución uniforme entre train y test.
+
+```{r}
+datEnd2$population_sc = scale(datEnd2$population) # Train
+datTest$population_sc = scale(datTest$population) # Test
+```
+
+### Agrupación de variables con árboles
+
+Vamos a generar agrupaciones de las variables scheme_management y region porque dan mejores resultados estás variables de tal modo. Optaremos por la agrupación mediante árboles de decisión haciendo uso de la función rpart(). Estos arboles clasificarán cada una de las variables independientes escogidas, en este caso dos, conforme a la dependiente status_group mediante un árbol de decisión, cuyas clasificaciones generadas obtendremos y agruparemos así nuestro par de variables.
+
+```{r}
+# Region
+tree<-rpart(status_group~region, data=datEnd2)
+da<-cbind(var=datEnd2$region,tree=tree$where,obj=datEnd2$status_group)
+datEnd2$region_agrup<-factor(tree$where)
+levels(datEnd2$region_agrup) 
+tabla.agrupada = datEnd2 %>% dplyr::group_by(region_agrup, region) %>% dplyr::summarize(total = n())
+agrupador1 <- merge(datTest, tabla.agrupada, by.x = "region", by.y="region", all.x =TRUE)
+agrupador1 = agrupador1 <- subset(agrupador1, select = c(id, region_agrup))
+datTest <- merge(datTest, agrupador1, by.x = "id", by.y="id", all.x =TRUE, sort= FALSE)
+datTest[,as.vector(which(sapply(datTest, class)=="factor"))]<-sapply(Filter(is.factor, datTest),function(x) ImputacionCuali(x,"aleatorio"))
+datTest$region_agrup = as.factor(datTest$region_agrup)
+
+# scheme_management
+tree<-rpart(status_group~scheme_management, data=datEnd2)
+da<-cbind(var=datEnd2$scheme_management,tree=tree$where,obj=datEnd2$status_group)
+datEnd2$scheme_management_agrup<-factor(tree$where)
+levels(datEnd2$scheme_management_agrup)
+tabla.agrupada = datEnd2 %>% dplyr::group_by(scheme_management_agrup, scheme_management) %>% dplyr::summarize(total = n())
+agrupador1 <- merge(datTest, tabla.agrupada, by.x = "scheme_management", by.y="scheme_management", all.x =TRUE)
+agrupador1 = agrupador1 <- subset(agrupador1, select = c(id, scheme_management_agrup))
+datTest <- merge(datTest, agrupador1, by.x = "id", by.y="id", all.x =TRUE, sort= FALSE)
+```
+
+## MODELO RANGER(). MODELO OBTENIDO EN EL GRUPO 8: SCORE 0.8162
+
+El mejor modelo que obtuvimos por parte de nuestro Grupo 8 fue el siguiente, si bien no realizamos el EDA y el pre-procesado de los datos que acabo de realizar, pero se obtiene igual puntuación a la que obtuvimos en grupo.
+
+```{r}
+# Modelo Ranger
+my_mod2 <- ranger(
+  as.factor(status_group) ~ id + amount_tsh + longitude + latitude +
+    gps_height + num_private + region_code + district_code
+  + population + construction_year
+  +basin + region + scheme_management + extraction_type+
+    extraction_type_group+ extraction_type_class + management
+  + management_group + payment + payment_type + water_quality + 
+    quality_group+ quantity + quantity_group + source+
+    source_type + source_class + waterpoint_type + waterpoint_type_group, data=datEnd, importance ='impurity',
+  verbose = TRUE, seed=1234)
+
+#my_mod2 
+
+# Matriz de confusión
+my_mod2$confusion.matrix
+```
+
+### Submission
+
+```{r}
+# Realizamos las predicciones del modelo en el dataset de test
+pred_test2 <- as.vector(predict(my_mod2, datTest)$prediction)
+
+# Generamos un data frame con los IDs y la predicción
+my_sub2 <- data.frame(id = datTest$id, status_group = pred_test2)
+
+# Generamos el csv
+fwrite(my_sub2, file="submission_pump_it_up1.csv", sep=",")
+```
+
+**El score obtenido es de 0,8162**.
+
+## MODELO RANGER(). MEJORA DEL MODELO: SCORE 0.8234
+
+Con las variables previamente ya tratadas, voy a intentar mejorar el modelo incluyendo en el mismo otras variables y haciendo uso de las mejoras sobre las mismas realizadas con el EDA y el Feature Engineering anterior, usamos ranger().
+
+```{r}
+# Modelo Ranger
+my_mod <- ranger(as.factor(status_group) ~  
+           amount_tsh + volumen_bin +longitud_ok + latitude +
+           gps_height  +  district_code + population_sc + construction_year +
+           dif_days + reg_month + dist_geo + basin + region_agrup + scheme_management_agrup +
+           extraction_type + extraction_type_group + extraction_type_class + management +
+           management_group_commercial +management_group_other + management_group_parastatal +  
+           payment + payment_type + water_quality + quality_group + quantity + quantity_group + source +  source_type + source_class + 
+           waterpoint_type + waterpoint_type_group +  permit_TRUE + public_meeting_TRUE + funder_2 + subvillage + ward,
+         data = datEnd2, 
+         importance = "impurity", 
+         mtry=6,
+         min.node.size=1.5,
+         num.trees = 700,
+         max.depth=0,
+         verbose = TRUE,      
+         seed = 1234) 
+
+my_mod # OOB prediction error: 18.09 % 
+
+# Matriz de confusión
+my_mod$confusion.matrix
+```
+
+### Submission
+
+```{r error = TRUE}
+# Realizamos las predicciones del modelo en el dataset de test
+pred_test <- as.vector(predict(my_mod, datTest)$prediction)
+
+# Generamos el dataframe con los IDs y la predicción
+my_sub <- data.frame(id = datTest$id, status_group = pred_test)
+
+# Generamos el csv
+fwrite(my_sub, file="submission_pump_it_up2.csv", sep=",")
+```
+El modelo mejora.
+**El score obtenido es de 0,8234**.
+
+## RETOMAMOS LA FASE DE FEATURE ENGINEERING
+
+Consideramos que hacer uso del *fastDummies()* no es la mejor creación de dummies que podrías realizar. Vamos a realizar otra creación de las mismas más controlada por nosotros o, quizá, más manual, ya que consideramos que podría mejorar el score de nuestro modelo.
+
+Para evitar problemas con las variables ya creadas, vamos a replicar todo lo generado trabajando sobre un nuevo set de train datEnd3.
+
+```{r}
+# Labels
+datLabel <- as.data.frame(fread("01_labels.csv", nThread = 4 ))
+dim(datLabel)
+
+# Train
+datTrain <- as.data.frame(fread("02_trainset.csv", nThread = 4 ))
+dim(datTrain)
+
+# Test
+datTest <- as.data.frame(fread('03_testset.csv', nThread = 4 ))
+dim(datTest)
+
+# Unión de Labels y Train
+all.equal(datLabel[,1], datTrain[,1]) 
+datEnd <- merge(datTrain, datLabel, by.x = "id", by.y="id", all = TRUE)
+
+datEnd3 = datEnd
+
+datEnd3[,c(11, 13, 19, 21, 23, 25:41)] = lapply(datEnd3[,c(11, 13, 19, 21, 23, 25:41)], factor)
+datTest[,c(11, 13, 19, 21, 23, 25:40)] = lapply(datTest[,c(11, 13, 19, 21, 23, 25:40)], factor)
+
+# train
+datEnd3 = datEnd3 %>% mutate(permit_SI = ifelse (permit == 'TRUE', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(permit_SI = ifelse (is.na(permit), 0, permit_SI)) 
+datEnd3 = datEnd3 %>% mutate(permit_NO = ifelse (permit == 'FALSE', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(permit_NO = ifelse (is.na(permit), 0, permit_NO)) 
+
+# test
+datTest = datTest %>% mutate(permit_SI = ifelse (permit == 'TRUE', 1, 0)) 
+datTest = datTest %>% mutate(permit_SI = ifelse (is.na(permit), 0, permit_SI)) 
+datTest = datTest %>% mutate(permit_NO = ifelse (permit == 'FALSE', 1, 0)) 
+datTest = datTest %>% mutate(permit_NO = ifelse (is.na(permit), 0, permit_NO)) 
+
+# train
+datEnd3 = datEnd3 %>% mutate(public_SI = ifelse (public_meeting == 'TRUE', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(public_SI = ifelse (is.na(public_meeting), 0, public_SI)) 
+datEnd3 = datEnd3 %>% mutate(public_NO = ifelse (public_meeting == 'FALSE', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(public_NO = ifelse (is.na(public_meeting), 0, public_NO)) 
+
+# test
+datTest = datTest %>% mutate(public_SI = ifelse (public_meeting == 'TRUE', 1, 0)) 
+datTest = datTest %>% mutate(public_SI = ifelse (is.na(public_meeting), 0, public_SI)) 
+datTest = datTest %>% mutate(public_NO = ifelse (public_meeting == 'FALSE', 1, 0)) 
+datTest = datTest %>% mutate(public_NO = ifelse (is.na(public_meeting), 0, public_NO))
+
+# train
+datEnd3 = datEnd3 %>% mutate(management_groupc = ifelse (management_group == 'commercial', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(management_groupo = ifelse (management_group == 'other', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(management_groupp = ifelse (management_group == 'parastatal', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(management_groupu = ifelse (management_group == 'user-group', 1, 0)) 
+datEnd3 = datEnd3 %>% mutate(management_groupg = ifelse (management_group == 'unknown', 1, 0)) 
+
+# test
+datTest = datTest %>% mutate(management_groupc = ifelse (management_group == 'commercial', 1, 0)) 
+datTest = datTest %>% mutate(management_groupo = ifelse (management_group == 'other', 1, 0)) 
+datTest = datTest %>% mutate(management_groupp = ifelse (management_group == 'parastatal', 1, 0)) 
+datTest = datTest %>% mutate(management_groupu = ifelse (management_group == 'user-group', 1, 0)) 
+datTest = datTest %>% mutate(management_groupg = ifelse (management_group == 'unknown', 1, 0)) 
+
+# train
+datEnd3$funder_2 = as.factor(substr(datEnd$funder, 1, 1))
+
+# test
+datTest$funder_2 = as.factor(substr(datTest$funder, 1, 1))
+
+# train
+datEnd3$volumen_log = log(datEnd3$amount_tsh + 1)
+datEnd3$volumen_2 = datEnd3$volumen_log * datEnd3$volumen_log
+datEnd3$volumen_bin = 0
+datEnd3$volumen_bin[datEnd3$volumen_log>3.61]=1
+
+# test
+datTest$volumen_log = log(datTest$amount_tsh + 1)
+datTest$volumen_2 = datTest$volumen_log * datTest$volumen_log
+datTest$volumen_bin = 0
+datTest$volumen_bin[datTest$volumen_log>3.61]=1
+
+# train
+datEnd3$dif_days <- as.numeric(as.Date("2014-01-01") - as.Date(datEnd3$date_recorded))
+datEnd3$reg_month <- month(ymd(datEnd3$date_recorded))
+datEnd3$reg_year <- year(ymd(datEnd3$date_recorded))
+
+# test
+datTest$dif_days <- as.numeric(as.Date("2014-01-01") - as.Date(datTest$date_recorded))
+datTest$reg_month <- month(ymd(datTest$date_recorded))
+datTest$reg_year <- year(ymd(datTest$date_recorded))
+
+# train
+datEnd3$dist_geo <- distGeo(as.matrix(datEnd3[,c('longitude','latitude')]), c(0,0))
+
+# test
+datTest$dist_geo <- distGeo(as.matrix(datTest[,c('longitude','latitude')]), c(0,0))
+
+# train
+longsummary <- aggregate(longitude~region,data=datEnd3[(datEnd3$longitude!=0),], FUN=mean)
+datEnd3$longitud_ok = datEnd3$longitud
+nrow(datEnd3[datEnd3$longitud_ok==0,]) 
+
+listado_regiones = levels(datEnd3$region)
+for (r in listado_regiones){
+  datEnd3$longitud_ok[datEnd3$region== r & datEnd3$longitude==0] <- longsummary$longitude[longsummary== r]}
+
+# test
+datTest$longitud_ok = datTest$longitud
+nrow(datTest[datTest$longitud_ok==0,]) 
+
+listado_regiones_test = levels(datTest$region)
+for (r in listado_regiones_test){
+  datTest$longitud_ok[datTest$region== r & datTest$longitude==0] <- longsummary$longitude[longsummary== r]}
+
+datEnd3$population_sc = scale(datEnd3$population)
+datTest$population_sc = scale(datTest$population)
+
+varObjCont_num = as.numeric(datEnd3$status_group)
+
+ImputacionCuali <- function(vv,tipo){#tipo debe tomar los valores moda o aleatorio
+  if (tipo=="moda"){
+    vv[is.na(vv)]<-names(sort(table(vv),decreasing = T))[1]
+  } else if (tipo=="aleatorio"){
+    vv[is.na(vv)]<-sample(vv[!is.na(vv)],sum(is.na(vv)),replace = T)
+  }
+  factor(vv)
+}
+
+tree<-rpart(varObjCont_num~scheme_management, data=datEnd3) ;tree
+da<-cbind(var=datEnd3$scheme_management,tree=tree$where,obj=varObjCont_num)
+aggregate(var~tree, data=da, mean) ; aggregate(obj~tree, data=da, mean)
+datEnd3$scheme_management_agrup<-factor(tree$where); levels(datEnd3$scheme_management_agrup)
+tabla.agrupada = datEnd3 %>% dplyr::group_by(scheme_management_agrup, scheme_management) %>% dplyr::summarize(total = n())
+agrupador1 <- merge(datTest, tabla.agrupada, by.x = "scheme_management", by.y="scheme_management", all.x =TRUE)
+agrupador1 = agrupador1 <- subset(agrupador1, select = c(id, scheme_management_agrup))
+datTest <- merge(datTest, agrupador1, by.x = "id", by.y="id", all.x =TRUE, sort= FALSE)
+
+
+tree<-rpart(varObjCont_num~region, data=datEnd3) ;tree
+da<-cbind(var=datEnd3$region,tree=tree$where,obj=varObjCont_num)
+aggregate(var~tree, data=da, mean) ; aggregate(obj~tree, data=da, mean)
+datEnd3$region_agrup<-factor(tree$where); levels(datEnd3$region_agrup) 
+tabla.agrupada = datEnd3 %>% dplyr::group_by(region_agrup, region) %>% dplyr::summarize(total = n())
+agrupador1 <- merge(datTest, tabla.agrupada, by.x = "region", by.y="region", all.x =TRUE)
+agrupador1 = agrupador1 <- subset(agrupador1, select = c(id, region_agrup))
+datTest <- merge(datTest, agrupador1, by.x = "id", by.y="id", all.x =TRUE, sort= FALSE)
+datTest[,as.vector(which(sapply(datTest, class)=="factor"))]<-sapply(Filter(is.factor, datTest),function(x) ImputacionCuali(x,"aleatorio"))
+
+datTest$region_agrup = as.factor(datTest$region_agrup)
+```
+
+## MODELO RANGER(). MEJOR MODELO OBTENIDO: SCORE 0.8265
+
+Vamos a correr de nuevo el modelo ranger().
+
+```{r error= FALSE}
+my_mod3 <- ranger(as.factor(status_group) ~  
+           amount_tsh + volumen_bin +longitud_ok + latitude + 
+           gps_height  +  district_code + population_sc + construction_year +
+           dif_days + reg_month + dist_geo +     
+           basin + region_agrup + scheme_management_agrup + 
+           extraction_type + extraction_type_group +
+           extraction_type_class + 
+           management + 
+           management_groupc +management_groupo + management_groupp +
+           management_groupu + payment + payment_type + 
+           water_quality + quality_group +      
+           quantity + quantity_group + source +
+           source_type + source_class +     
+           waterpoint_type + waterpoint_type_group + 
+           permit_SI + public_SI + funder_2+ subvillage + ward,      
+         data = datEnd3, 
+         importance = "impurity", 
+         mtry=6,
+         min.node.size=1.5,
+         num.trees = 700,
+         max.depth=0,
+         verbose = TRUE,      
+         seed = 1234) 
+
+my_mod3
+my_mod3$confusion.matrix
+
+# Realizamos las predicciones del modelo en el dataset de test
+pred_test3 <- as.vector(predict(my_mod3, datTest)$prediction)
+
+# Generamos un data frame con los IDs y la predicción
+my_sub3 <- data.frame(id = datTest$id, status_group = pred_test3)
+
+# Generamos el csv
+fwrite(my_sub3, file="submission_pump_it_up3.csv", sep=",")
+```
+
+El modelo mejora.
+**El score obtenido es de 0,8265**.
+
+### RESULTADO SCORE EN LA COMPETICIÓN CON EL MEJOR MODELO OBTENIDO RANGER()
+
+![Score 0.8265 obtenido con el modelo Ranger()](C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/score.png)
+
+## XGBOOST PRELIMINAR
+
+Sabemos que usar el autoML con h2o.automl() no da mejores resultados de Score que al usar range(). Sin embargo, por enriquecer nuestro trabajo y conocimientos, vamos a ver si con el uso de xgboost podemos obtener mejores resultados que con el range(), o al menos parecidos.
+
+```{r message=FALSE, warning=FALSE}
+# Carga de las librerías necesarias
+library(xgboost)
+library(Matrix)
+library(caret)
+library(dplyr)
+library(MatrixModels)
+library(data.table)
+
+# Fijo el directorio de trabajo
+setwd('C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition')
+
+# Carga de datos
+train <- read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/02_trainset.csv")
+test <- read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/03_testset.csv")
+labels <- read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/01_labels.csv")
+
+# Dimensiones
+dim (labels)
+dim(train)
+dim (test)
+
+# Resumen datos train
+str(train)
+
+# Variable target
+target <- labels$status_group
+target <- as.numeric(as.factor(target)) - 1 # 0 -> func / 1 -> func_repair / 2 -> non_funct
+
+# Union de Labels y Train
+train <- merge(train, labels, by.x = "id", by.y="id", all = TRUE)
+
+# Preprocesado y Feature Engineering
+
+# Transformación de variables a Factor
+train[,c(11, 13, 19, 21, 23, 25:41)] = lapply(train[,c(11, 13, 19, 21, 23, 25:41)], factor)
+test[,c(11, 13, 19, 21, 23, 25:40)] = lapply(test[,c(11, 13, 19, 21, 23, 25:40)], factor)
+
+# Dejamos train como estaba, sin status_gruop
+train <- select(train, -status_group)
+
+# DMatrix train
+train_xgb <- train[ , 1:(ncol(train) - 1)]
+set.seed(1234)
+xgmat <- xgb.DMatrix(data.matrix(train_xgb[,-1]), label = target)
+
+# DMatrix test
+test_xgb <- test[ , 1:(ncol(test) - 1)]
+xgmat_test <- xgb.DMatrix(data.matrix(test_xgb[,-1]))
+
+# Configuración de parámetros
+nc <- length(unique(target))
+nc
+
+params <- list(booster = "gbtree",
+               objective = "multi:softprob",
+               num_class = 3,
+               eval_metric = "mlogloss",
+               eta=0.0435073598870076, # contra más bajo, más robusto frente a over-fitting 
+               gamma = 0.12,
+               max_depth=14,
+               min_child_weight = 0,
+               scale_pos_weight=1,
+               max_delta_step=2.39724806486629)
+
+
+# Xgboost, eXtreme Gradient Boosting Model
+xgb <- xgboost(params = params, data = xgmat, nrounds = 100,
+                showsd = TRUE, stratified = TRUE, early_stop_round = 20, 
+                maximize = FALSE, prediction = TRUE)
+
+
+# Precciones sobre test
+y_pred <- predict(xgb, xgmat_test, reshape = T)
+colnames(y_pred) <- c("functional", "functional needs repair", "non functional")
+
+pred_test4 <- apply(y_pred, 1 , function(x) colnames(y_pred)[which.max(x)])
+
+# Generamos un data frame con los IDs y la predicción
+my_sub4 <- data.frame(id = test$id, status_group = pred_test4)
+
+# Generamos el csv
+fwrite(my_sub4, file="submission_pump_it_up_xgboost4.csv", sep=",")
+```
+
+El modelo empeora considerablemente.
+**El score obtenido es sólo de 0,5281**.
+
+El xgboost presente da muy malos resultados debido a la falta de tratamiento de las variables, consideramos que puede ser mejorado; por tanto, vamos a realizar de nuevo un tratamiento de las variables óptimo para lograr este objetivo con xgboost a continuación.
+
+## MODELO XGBOOST MEJORADO: SCORE 0.8147
+
+Vamos a proceder a realizar de nuevo nuestro modelo XGBoost pero mejorado; para ello, comenzaremos desde el inicio. 
+El conjunto de datos original contiene 41 variables como ya sabemos, lo vamos a reducir a 26 variables eliminando variables que son similares o están duplicadas de otras variables. También modificaremos algunas variables para reducir los efectos de los datos faltantes.
+
+### Carga de datos desde el inicio
+
+```{r}
+test<-read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/03_testset.csv")
+train<-read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/02_trainset.csv")
+label<-read.csv("C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/dataset competition/01_labels.csv")
+
+# Creación de una nueva columna en test 
+test$status_group <- 0
+
+# Subset de label pues sólo contiene label (la variable objetivo o target)
+label <- subset(label, select = status_group )
+
+# Combinamos train y label, en este caso usamos cbind aunque antes usamos merge pero tienen igual orden
+train<-cbind(train,label)
+
+# Creamos una nueva columna status_group en test (con el mismo numero de columnas) 
+# Este paso es requerido para la creación de nuestro modelo xgboost
+train$status_group<-0
+
+# Definimos columnas en train y test
+train$tst <- 0
+test$tst <- 1
+
+# Unimos train y test en nuestro dataset
+data<- rbind(train,test)
+```
+
+### Feature Engineering
+
+```{r}
+# Cambiamos date_recorded a tipo de variable fecha
+data$date_recorded<-as.Date(data$date_recorded)
+
+# Transformamos region_code y district_code a factor
+data$region_code<-factor(data$region_code)
+data$district_code<-factor(data$district_code)
+
+# Transformamos construction_year para que empiece en el 0 y sea incremental, es decir, 1960=0, 1961=1, etc.
+min_year<-1960
+data$construction_year<-data$construction_year-min_year
+
+# Imputamos los missings de construction_year con la media
+data$construction_year[data$construction_year<0]= median(data$construction_year[data$construction_year>0])
+
+# Imputamos los missings de gps_height con la media
+data$gps_height[data$gps_height==0]=median(data$gps_height[data$gps_height>0])
+```
+
+### Selección de variables
+
+A continuación, vamos a eliminar duplicados y variables que no aportan nada para la mejora de nuestro modelo. 
+
+```{r}
+# Eliminamos num_private ya que no aporta información de mejora
+data$num_private<-NULL
+
+# Eliminamos recorded_by ya que sólo contiene valores únicos
+data$recorded_by<-NULL
+
+# Eliminamos wpt_name porque contiene muchos valores únicos
+data$wpt_name<-NULL
+
+# Elminamos estas dos variales porque son similares a extraction_type_class
+data$extraction_type_group<-NULL
+data$extraction_type<-NULL
+
+# Eliminamos payment_type por ser similar a payment
+data$payment_type<-NULL
+
+# Eliminamos water_quality por ser similar a quality_group
+data$water_quality<-NULL
+
+# Esta vez vamos a optar por eliminar scheme_management en lugar de tramearla
+data$scheme_management<-NULL
+
+# Eliminamos todas las variables de localización, vamos a optar por quedarnos con longitud y latitud
+# ya que consideramos que con esas dos variables debería ser suficiente
+data$district_code<-NULL
+data$region<-NULL
+data$region_code<-NULL
+data$subvillage<-NULL
+data$ward<- NULL
+
+# Eliminamos waterpoint_type_group por ser similar a waterpoint_type
+data$waterpoint_type_group<-NULL
+
+# Eliminamos quantity_group por ser similar a quantity
+data$quantity_group<-NULL
+
+# Eliminamos installer por contener demasiados valores únicos
+data$installer<-NULL
+
+# Separamos el dataset en train y test
+data_train <- data[data$tst==0,]
+data_test <- data[data$tst==1,]
+
+colnames(data_train)
+colnames(data_test)
+
+# Dejamos train y test preparados para poder generar nuestro modelo xgboost
+data_test<-subset(data_test, select = c(-tst,-status_group))
+data_train<-subset(data_train, select = c(-tst,-status_group))
+
+# Variable target
+target <- label$status_group
+target <- as.numeric(as.factor(target)) - 1 # 0 -> func / 1 -> func_repair / 2 -> non_funct
+
+# DMatrix train
+train_xgb <- data_train[ , 1:(ncol(data_train) - 1)]
+set.seed(1234)
+xgmat <- xgb.DMatrix(data.matrix(train_xgb[,-1]), label = target)
+
+# DMatrix test
+test_xgb <- data_test[ , 1:(ncol(data_test) - 1)]
+xgmat_test <- xgb.DMatrix(data.matrix(test_xgb[,-1]))
+```
+
+### XGBoost
+
+Vamos a generar un modelo xgboost con un número de rounds igual a 100.
+
+```{r}
+# Configuración de parámetros
+params <- list(booster = "gbtree",
+               objective = "multi:softprob",
+               num_class = 3,
+               eval_metric = "mlogloss",
+               eta=0.0435073598870076, # contra más bajo, más robusto frente a over-fitting 
+               gamma = 0.12,
+               max_depth=14,
+               min_child_weight = 0,
+               scale_pos_weight=1,
+               max_delta_step=2.39724806486629)
+
+# Xgboost, eXtreme Gradient Boosting Model
+xgb2 <- xgboost(params = params, data = xgmat, nrounds = 100,
+               showsd = TRUE, stratified = TRUE, early_stop_round = 20, 
+               maximize = FALSE, prediction = TRUE)
+
+xgb2
+```
+
+### Predicción
+
+```{r}
+# Precciones sobre test
+y_pred2 <- predict(xgb2, xgmat_test, reshape = T)
+colnames(y_pred2) <- c("functional", "functional needs repair", "non functional")
+
+pred_test5 <- apply(y_pred2, 1 , function(x) colnames(y_pred2)[which.max(x)])
+
+# Matriz de confusión
+cbind(pred_test5, label) %>% 
+  data.frame() %>% 
+  table() %>% 
+  confusionMatrix()
+```
+
+El Accuracy de la matriz de confusión la verdad es que parece no dar muy alto, no dar un buen resultado. Sin embargo, vamos a validar nuestra predicción en la competición.
+
+### Submission
+
+```{r}
+# Generamos un data frame con los IDs y la predicción
+my_sub5 <- data.frame(id = test$id, status_group = pred_test5)
+
+# Generamos el csv
+fwrite(my_sub5, file="submission_pump_it_up_xgboost5.csv", sep=",")
+```
+
+**El score obtenido es de 0,8147**. 
+
+Ha mejorado considerablemente después del tratamiento y selección cuidadosa de variables; pero tal resultado no es mejor que el obtenido con ranger().
+
+### RESULTADO SCORE EN LA COMPETICIÓN CON XGBOOST()
+
+![Score 0.8147 obtenido con el modelo xgboost()](C:/Users/maria/Desktop/Temario Big Data/10 Machine Learning 2/scorexgboost.png)
+
+
